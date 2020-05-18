@@ -1,0 +1,319 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <sndfile.h>
+#include <math.h>
+#include <complex.h>
+#include <time.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#define TAILLE_ECHANTILLONAGE 1024
+#define PI 3.1416
+#define M_PI 3.1416
+#define TAILLE_SPECTRE 128
+#define LARGEUR 64
+#define HAUTEUR 24
+#define SWAP(a,b) ctmp=(a),(a)=(b),(b)=ctmp
+#define ARRAY_LEN(x) ((int) (sizeof(x)/sizeof(x[0])))
+
+
+SNDFILE *infile, *outfile;
+SF_INFO sfinfo_in,sfinfo_out;
+//infile = sf_open("input.wav",SFM_READ, &sfinfo)
+//FONCTIONS UTILITAIRES//
+
+double LOG2(double x)
+{
+    return log10(x) / log10(2);
+}
+
+double module(double complex a){
+  return sqrt(creal(a)*creal(a)+cimag(a)*cimag(a));
+}
+
+double MIN(double a, double b){
+  if (a>b)
+    {
+      return b;
+    }
+  else
+    {
+      return a;
+    }
+}
+
+double max(double t[], double m){
+  double max=t[0];
+  for(int i=1;i<m;i++){
+    if(max<t[i]){
+      max=t[i];
+    }
+  }
+  return max;
+}
+
+
+complex doubletocomplexe(double vdouble){
+  return (_Complex double)vdouble;
+}
+
+void stop(int t){
+  clock_t time=clock();
+  while((clock()-time)<=t*CLOCKS_PER_SEC/1000);
+}
+
+double TEMPS(double temps_1, double temps_2) {
+  if (temps_1<temps_2)
+    {
+      return (temps_2-temps_1)/(double)(CLOCKS_PER_SEC);
+    }
+  else
+    {
+      return (1000-(temps_1-temps_2))/(double)(CLOCKS_PER_SEC);
+    }
+}
+//OUVERTURE DES FICHIERS//
+
+SNDFILE *open_input_file(char *name){
+  infile = sf_open(name, SFM_READ, &sfinfo_in);
+  if (infile == NULL)
+    {
+      printf("Not able to open input file %s\n", name);
+      sf_perror(NULL);
+      return NULL;
+    }
+  return infile;
+}
+
+SNDFILE *open_output_file(char *name){
+  outfile = sf_open(name, SFM_WRITE, &sfinfo_out);
+  if (outfile == NULL)
+    {
+      printf("Not able to open ouput file %s\n", name);
+      sf_perror(NULL);
+      return NULL;
+    }
+  return outfile;
+}
+
+// CREATION DES FONCTIONS DE FOURRIER //
+  
+void fftrec(double complex *data, double complex *result, unsigned int size, int log2n){//**
+	double complex ypair[size], yimpair[size], Fimpair[size], Fpair[size];
+	int n,k,N2;
+	if(size>1){
+		N2=size/2;
+		for(n=0;n<N2;n++){
+			ypair[n] = data[n]+data[n+N2];
+			yimpair[n] = (data[n]-data[n+N2])*cexp(-2*I*M_PI*n/size);
+		}
+		fftrec(ypair,Fpair,N2,log2n);
+		fftrec(yimpair,Fimpair,N2,log2n);
+		for(n=0;n<N2;n++){
+			result[2*n]=Fpair[n];
+			result[2*n+1]=Fimpair[n];
+		}
+	}
+	else{
+		result[0]=data[0];
+		return;
+	}
+
+}
+
+//precalculage du twiddle factor
+void twiddle(double complex *TW, unsigned int size){//**
+	double complex phi = cexp(-2*I*M_PI/size);
+	TW[0]=1;
+	for(int i=1; i<size; i++) {
+		TW[i]=TW[i-1]*phi;
+    }
+}
+
+double complex TW[TAILLE_ECHANTILLONAGE];
+
+int bitrev(int inp,int numbits){
+  int rev=0;
+  for (int i=0;i<numbits;i++)
+    {
+      rev=(rev<<1) | (inp & 1);
+      inp>>1;
+	}
+  return rev;
+}
+
+void fftiterTW(double complex *data, unsigned int size, int log2n){//**
+	int j, N2, Bpair, Bimpair, Bp=1, N=size;
+	double complex impair, pair, ctmp;
+
+	for(int k=0; k<log2n;k++){
+		N2=N/2;
+		Bpair=0;
+		for(int b=0; b<Bp;b++){
+			Bimpair=Bpair+N2;
+			for(int n=0;n<N2;n++){
+				impair = data[Bpair+n] + data[Bimpair+n];
+				pair = (data[Bpair+n] - data[Bimpair+n])*TW[n*size/N];
+				data[Bpair+n] = pair;
+				data[Bimpair+n] = impair;
+			}
+			Bpair = Bpair+N;
+		}
+		Bp=Bp*2;
+		N=N2;
+	}
+	for(int i=0;i<size;i++){
+		j=bitrev(i,log2n);
+		if(j>i){
+			SWAP(data[j],data[i]);
+		}
+	}
+	for(int i=size-1;i>0;i--){
+		data[i]=data[i-1];
+	}
+	data[0]=ctmp;
+	return;
+}
+
+//On veut maintenant faire la DFT du signal, c'est une simple somme et une formule à appliquer
+void DFT(complex *data,double complex *dft,int taille){
+  for (int i=0;i<TAILLE_ECHANTILLONAGE;i++)
+    {
+      for (int j=0; j<TAILLE_ECHANTILLONAGE;j++)
+	{
+	  dft[i]=dft[i]+data[j]*cexp(-2*I*PI*j*i/taille);
+	}
+    }
+}
+
+
+//FONCTION QUI PARTITIONNE LE FICHIER AUDIO//
+
+sf_count_t sfx_mix_mono_read_double (SNDFILE * file, double * data, sf_count_t datalen){
+  SF_INFO info;
+  static double multi_data[2048];
+  int k, ch, frames_read;
+  sf_count_t dataout = 0;
+  sf_command (file, SFC_GET_CURRENT_SF_INFO, &info, sizeof(info));
+  if (info.channels == 1)
+    	return sf_read_double (file, data, datalen);
+  while (dataout < datalen){   
+   		int this_read ;
+		this_read = MIN(ARRAY_LEN(multi_data) / info.channels, datalen);
+		frames_read = sf_readf_double (file, multi_data, this_read);
+		if (frames_read == 0)
+				break;
+		for (k = 0 ; k < frames_read ; k++){       
+				double mix = 0.0 ;
+				for (ch = 0 ; ch < info.channels ; ch++)
+						mix += multi_data [k * info.channels + ch] ;
+		        data [dataout + k] = mix / info.channels ;
+        } 
+    	dataout += this_read ;
+    } 
+  	return dataout ;
+}
+
+
+//FONCTIONS QUI CREENT ET TRACENT LE SPECTRE//
+
+double creationspectre(double complex data[],int taille,double spectre[]){
+  double amplitude=0;
+  int position=0,nbr_element=0;
+  for (int i=0;i<taille;i++)
+    {
+      amplitude=amplitude+module(data[i]);
+      nbr_element++;
+      if (i%(taille/TAILLE_SPECTRE)==0)
+	{
+	  spectre[position]=20*log10(amplitude/nbr_element);
+	  position++;
+	  nbr_element=0;
+	  amplitude=0;
+	}
+    }
+}
+
+
+//On balaye la matrice et on affiche des ° pour voir le spectre sur la largeur maximale definie
+void tracer_spectre(double *spectre){
+  int MAX=max(spectre,LARGEUR);
+  double TABLEAU_AFFICHAGE[LARGEUR];
+  for(int i=0;i<HAUTEUR;i++)
+    {
+      for(int j=0;j<LARGEUR;j++)
+	{
+	  if(spectre[j]>=MAX-i)
+	    {
+	      printf("°");
+	    }
+	  else
+	    {
+	      printf(" ");
+	    }
+	}printf("\n");
+    }
+}
+  
+int affichage_spectre(){
+  system("clear");
+  double data[TAILLE_ECHANTILLONAGE];
+  double spectre[TAILLE_SPECTRE];
+  double complex data_complexe[TAILLE_ECHANTILLONAGE];
+  double complex spectre_complexe[TAILLE_ECHANTILLONAGE];
+  sf_count_t compteur;
+  open_input_file("lapur.wav");
+  twiddle(TW,TAILLE_ECHANTILLONAGE); 
+  while((compteur=sfx_mix_mono_read_double(infile,data,TAILLE_ECHANTILLONAGE))>0){
+    for(int i=0;i<TAILLE_ECHANTILLONAGE;i++)
+      {
+	data_complexe[i]=doubletocomplexe(data[i]);
+      }
+    fftrec(data_complexe,spectre,TAILLE_ECHANTILLONAGE,10);//Mettre la transformée qu'on veut
+    creationspectre(data_complexe,TAILLE_ECHANTILLONAGE,spectre);
+    tracer_spectre(spectre);
+    stop(100);
+    system("clear");
+  }
+  sf_close(infile);
+}
+
+void temps_calcul(){
+  open_input_file("helium_speech.wav");
+  double complex data_complexe[TAILLE_ECHANTILLONAGE];
+  double  data[TAILLE_ECHANTILLONAGE];
+  double complex resultatDFT[TAILLE_ECHANTILLONAGE];
+  double complex spectre[TAILLE_ECHANTILLONAGE];
+  double tempsFFTiter,tempsDFT,tempsfftrec;
+  sf_count_t compteur;
+  compteur=sfx_mix_mono_read_double(infile,data,TAILLE_ECHANTILLONAGE);
+  for (int i=0;i<TAILLE_ECHANTILLONAGE;i++)
+    {
+      data_complexe[i]=doubletocomplexe(data[i]);
+    }
+  struct timeval temps_FFTiter_avant,temps_FFTiter_apres;
+  gettimeofday(&temps_FFTiter_avant,NULL);
+  fftiterTW(data_complexe,TAILLE_ECHANTILLONAGE,10);
+  gettimeofday(&temps_FFTiter_apres,NULL);
+  tempsFFTiter=TEMPS(temps_FFTiter_avant.tv_usec,temps_FFTiter_apres.tv_usec);
+  struct timeval temps_DFT_avant,temps_DFT_apres;
+  gettimeofday(&temps_DFT_avant,NULL);
+  DFT(data_complexe,resultatDFT,TAILLE_ECHANTILLONAGE);
+  gettimeofday(&temps_DFT_apres,NULL);
+  tempsDFT=TEMPS(temps_DFT_avant.tv_usec,temps_DFT_apres.tv_usec);
+  struct timeval temps_fftrec_avant,temps_fftrec_apres;
+  gettimeofday(&temps_fftrec_avant,NULL);
+  fftrec(data_complexe,spectre,TAILLE_ECHANTILLONAGE,10);
+  gettimeofday(&temps_fftrec_apres,NULL);
+  tempsfftrec=TEMPS(temps_fftrec_avant.tv_usec,temps_fftrec_apres.tv_usec);
+  sf_close(infile);
+  printf("temps d'une FFT itérative = %lf ms\n",tempsFFTiter*1000);
+  printf("temps d'une DFT = %lf ms\n",tempsDFT*1000);
+  printf("temps d'un FFT recursive = %lf ms\n",tempsfftrec*1000);
+}
+
+int main(int argc,char *argv[]){
+  affichage_spectre();
+  temps_calcul();
+  return EXIT_SUCCESS;
+}
